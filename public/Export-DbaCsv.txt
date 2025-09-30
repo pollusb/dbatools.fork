@@ -1,0 +1,7 @@
+Exemples d'appels
+
+1. Pour une liste de tables
+
+```
+$tables = Get-DbaDbTable -SqlInstance DEVOPS-VM -Database StackOverflow
+```

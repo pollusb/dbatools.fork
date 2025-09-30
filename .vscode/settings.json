@@ -89,5 +89,6 @@
     ],
     "files.exclude": {
         "**/.aider.tags.cache.v3": true
-    }
+    },
+    "workbench.colorTheme": "Solarized Dark"
 }

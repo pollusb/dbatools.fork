@@ -261,155 +261,413 @@ function Export-DbaCsv {
         If the CSV has no headers, passing a ColumnMap works when you have as the key the ordinal of the column (0-based).
         In this example the first CSV field is inserted into SQL column 'FirstName' and the second CSV field is inserted into the SQL Column 'PhoneNumber'.
     #>
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'TableOrView')]
     param (
         [Parameter(Mandatory)]
-        [DbaInstanceParameter[]]$SqlInstance,   # il faut prévoir comment connecter à azure ?
+        $SqlInstance,
+
         [PSCredential]$SqlCredential,
 
-        [Parameter(Mandatory)]
-        [object[]]$Path,
-        [string]$Nomenclature = '{Path}\{Database}\{Database}_{Schema}_{Name}_{FileId}',
-
         [string]$Database,
+
         [string]$Schema,
 
+        [Parameter(ParameterSetName = 'TableOrView', Mandatory)]
         [Parameter(ValueFromPipeline)]
-        [string]$Table,  # will accept three parts table or view name ex: Database.Schema.Name
+        [Alias('View')]
+        $Table,
 
-        [char]$Delimiter = ',',
-        #[ValidateSet('ASCII', 'BigEndianUnicode', 'Byte', 'String', 'Unicode', 'UTF7', 'UTF8', 'Unknown')]
-        [string]$Encoding = 'utf8',
+        [Parameter(ParameterSetName = 'TableOrView', Mandatory)]
+        [ValidateScript({ Test-Path $_ -Type Container })]
+        [string]$Path,
+
+        [Parameter(ParameterSetName = 'OneQuery', Mandatory)]
+        [int]$Query,
+
+        [Parameter(ParameterSetName = 'TableOrView')]
+        [Parameter(ParameterSetName = 'OneQuery', Mandatory)]
+        [string]$FilePath,
+
+        [string]$Delimiter = ',',
+
+        [int]$BatchSize = 100000,
+
+        [ValidateSet('ASCII', 'BigEndianUnicode', 'Byte', 'String', 'Unicode', 'UTF7', 'UTF8', 'Unknown')]
+        [string]$Encoding = 'UTF8',
+
         [switch]$IncludeTypeInformation,
-        [switch]$NoHeader,
-        [string]$DatabaseCulture = "en-US",
 
-        [ValidateSet('Never', 'AsNeeded', 'Always')]
+
+        [string]$DatabaseCulture = 'en-US', # https://www.fincher.org/Utilities/CountryLanguageList.shtml
+
+        [ValidateScript({ $PSVersionTable.PSVersion.Major -gt 5 })]
+        [switch]$NoHeader,
+
+        [ValidateScript({ $PSVersionTable.PSVersion.Major -gt 5 })]
+        [ValidateSet('Never', 'AsNeeded', 'Always')]  # If PS5, then it will be Always
         [string]$UseQuotes,
 
+        [ValidateScript({ $PSVersionTable.PSVersion.Major -gt 5 })]
         [string[]]$QuoteFields,
 
-        [int]$BatchSize = 50000,
-        [int64]$MaxFileSize = 2GB,  # To generate multiple csv files
-        [switch]$Force,             # Overwrite files
+        [int64]$MaxFileSize,
+
+        [Parameter(ParameterSetName = 'TableOrView')]
+        [int64]$Top,  # To limit SELECTed rows from a table or view
+
+        [Parameter(ParameterSetName = 'TableOrView')]
+        [string]$Nomenclature = '{Path}\{Database}-{Schema}-{Name}-{FileId}',
+
         [switch]$EnableException
     )
     begin {
-        if ($PSVersionTable.PSVersion.Major -le 5 -and ($UseQuotes -or $QuoteFields)) {
-            Write-Message -Level Warning -Message 'Parameter -UseQuotes or -QuoteFields works only with PSv6+'
+        #region Initialization
+
+        $fullnameFormat = $Nomenclature -replace 'Path', '0' -replace 'Database', '1' `
+            -replace 'Schema', '2' -replace 'Name', '3' -replace 'FileId', '4:d3'
+
+        Write-Message -Level Verbose -Message "Nomenclature = '$fullnameFormat' (should not have orginal text)"
+
+        if ($DatabaseCulture) {
+            [CultureInfo]::CurrentCulture = $DatabaseCulture
         }
+
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+
+        #endregion
 
         #region Private functions
 
-        function New-CsvFile {
-            param (
-                [int]$FileId,
-                $tblObj
-            )
-            $format = $Nomenclature -replace 'Path', '0' -replace 'Database', '1' `
-                -replace '$Schema', '2' -replace 'Name', '3' -replace 'FileId', '4'
-
-            if (-not $script:once) { Write-Verbose "Nomenclature = '$format'"; $once = $true }
-            return ($format -f $Path, $tbl.Database, $tbl.Schema, $tbl.Name, $FileId)
-        }
-        function ConvertTo-TsqlColumnList {
+        function ConvertToTsqlColumnList {
             # Returns a list of columns for SELECT but CONVERT binary datatypes to VARCHAR
             # This is way faster than to convert locally
             param (
-                [Microsoft.SqlServer.Management.Smo.Column]$Columns
+                $Columns
             )
-            $arr = New-Object System.Collections.ArrayList
+            $colArray = New-Object System.Collections.ArrayList
             foreach ($col in $Columns) {
                 if ($col.DataType.Name -like '*binary') {
-                    $null = $arr.Add('convert(varchar({0}}),[{0}],1) as [{1}]' -f $col.Name)
-                }
-                else {
-                    $null = $arr.Add('[{0}]' -f $col.Name)
+                    #Write-Verbose "ICI $($col.DataType.Name)"
+                    $null = $arr.Add($("convert(varchar(100),[{0}],1) as {0}" -f $col.Name))
+                    $varcharMax = if ($col.DataType.MaximumLength -eq -1) { 'max' } else { $col.MaximumLength * 2 }
+                    $null = $colArray.Add('convert(varchar({0}),[{1}],1) as [{1}]' -f $varcharMax, $col.Name)
+                } else {
+                    $null = $colArray.Add('[{0}]' -f $col.Name)
                 }
             }
-            return $arr -join ','
+            return $colArray -join ','
         }
-        function ConvertTo-Hexadecimal {
-            # If too complicated to CONVERT BINARY to VARCHAR
+        function ConvertToHexadecimal {
+            # If too diffcult to CONVERT BINARY to VARCHAR in SELECT. 0x is added because TSQL does the same. We might need to keep data integrity
             param (
-                [byte[]] $BytesArray
+                [byte[]]$Bytes
             )
-            ($BytesArray | ForEach-Object { $_.ToString('X2') }) -join ''
+            "0x$([Convert]::ToHexString($Bytes))"
         }
+        function ExportQuery {
+            # Run SqlReader then Export only one query result to FilePath with overwrite
+            # Show a progress bar then return an object with RowCount per file
+            param (
+                [Parameter(Mandatory)]
+                [Microsoft.Data.SqlClient.SqlConnection]$sqlConn,
+
+                [Parameter(Mandatory)]
+                [string]$Query,             # Only one SELECT query
+
+                [Parameter(Mandatory)]
+                $FilePath,                  # Fullname must be provided with existing directory
+
+                $BatchSize,
+                $Encoding,
+                $Delimiter = ',',
+                $UseQuote,                  # Available only on PS core 6+ (validated higher in the stack)
+                $QuoteFields,               # Available only on PS core 6+ (validated higher in the stack)
+                [int32]$CommandTimeout = 0, # Zero will wait forever (not sure this will be useful to change)
+                [int64]$MaxFileSize = 0,    # Will split result into files if set (you can use 2GB and more)
+                [int64]$TableRowCount = 0,  # Will provide a percent completed progress bar when provided
+                [switch]$IncludeTypeInformation,
+                [switch]$NoProgress,
+                [switch]$NoHeader,
+                [switch]$EnableException
+            )
+            $splatExportCsv = @{
+                Delimiter         = $Delimiter
+                NoTypeInformation = -not $IncludeTypeInformation
+                Encoding          = $Encoding
+                Append            = $true
+            }
+            if ($UseQuotes) { $splatExportCsv.UseQuote = $UseQuotes }
+            if ($QuoteFields) { $splatExportCsv.QuoteFields = $QuoteFields }
+
+            # Running query...
+            try {
+                $sqlCommand = $sqlConn.CreateCommand()
+                $sqlCommand.CommandText = $Query
+                $sqlCommand.CommandTimeout = $CommandTimeout
+                $sqlDataReader = $sqlCommand.ExecuteReader()
+                if ($sqlDataReader.HasRows) {
+
+                    # Init data buffer
+                    $schema = $SqlDataReader.GetSchemaTable()
+                    $data = New-Object System.Data.DataTable
+
+                    # Use schema to define data buffer
+                    foreach ($col in $schema.Rows) {
+                        $colName = $col.ColumnName
+                        switch ($col.DataType) {
+                            # binary types will be converted to string hexadecimal (takes longer than convert it in the query)
+                            ([System.Byte[]]) { $t = [System.String]; break }
+                            default { $t = $col.DataType }
+                        }
+                        [void]$data.Columns.Add($colName, $t)
+                    }
+
+                    [int64]$rowId = 0
+                    [int32]$fileId = 1
+                    [int32]$batchId = 0
+                    [int32]$fileRowCount = 0
+
+                    # Create first or only file
+                    $csvPath = if ($MaxFileSize -eq 0) {
+                        $FilePath -replace '(\.\w+$)', ('-{0:d3}$1' -f $fileId)
+                    } else {
+                        $FilePath
+                    }
+                    # Do not Test-Path if Force
+                    if (-not $Force -and (Test-Path $csvFile)) {
+                        Stop-Function -Message "File already exists $csvFile. Use -Force to overwrite."
+                    }
+
+                    # Foreach row
+                    while ($SqlDataReader.Read()) {
+                        $rowId++
+                        $fileRowCount++
+
+                        # Add the current row to the batch data table
+                        $newRow = $data.Rows.Add();
+                        foreach ($col in $data.Columns) {
+                            $value = $SqlDataReader[$col.ColumnName]
+                            if ($value -is [System.Byte[]]) {
+                                $newRow[$col.ColumnName] = ConvertToHexadecimal $value
+                            } else {
+                                $newRow[$col.ColumnName] = $value
+                            }
+                        }
+
+                        # When rowid reaches -BatchSize or -MaxFileSize then save batch to file
+                        if (($rowid % $BatchSize -eq 0) -or $createNewFile) {
+                            $batchId++
+
+                            if ($createNewFile) {
+                                # No need to check MaxFilesSize because it's not the first file
+                                $csvPath = $FilePath -replace '(\.\w+$)', ('-{0:d3}$1' -f $fileId)
+                                if (-not $Force -and (Test-Path $csvPath)) {
+                                    Stop-Function -Message "File already exists $csvPath. Use -Force to overwrite."
+                                }
+                                $null = mkdir -Path (Split-Path $csvPath) -ErrorAction SilentlyContinue
+                                $createNewFile = $false
+                            }
+
+                            $data | Export-Csv -Path $csvPath @splatExportCsv
+
+                            if (-not $NoProgress) {
+                                $splatProgress = @{
+                                    Activity = 'Export-DbaCsv...'
+                                    Status   = 'File {0}' -f $csvPath
+                                }
+                                # Percent completed is available only if rowcount is given
+                                if ($TableRowCount -gt 0) {
+                                    $splatProgress.PercentComplete = ($rowid * 100 / $TableRowCount)
+                                }
+                                Write-Progress @splatProgress
+                            }
+
+                            [int64]$csvSize = (Get-ChildItem $csvPath).Length
+                            if (-not $avgRowSize) {
+                                [int32]$avgRowSize = $csvSize / $rowid
+                            }
+
+                            # MaxFileSize minus estimated rowsize to avoid spilling
+                            if ($createNewFile = $csvSize -gt ($MaxFileSize - $avgRowSize)) {
+                                # Actual file will not receive any more updates
+                                [PSCustomObject]@{
+                                    FileName      = $csvFile
+                                    FileRowCount  = $fileRowCount
+                                    TotalRowCount = $rowid
+                                    Length        = $csvSize
+                                }
+                                $fileRowCount = 0
+                            }
+
+                            # Then flush data buffer
+                            $data.Clear()
+                            $fileRowCount = 0
+                        }
+                    }
+                }
+            } catch {
+
+            }
+        }
+
         #endregion
-
-        # Connecting...
-        $SqlConnectionString = 'Data Source={0};Initial Catalog={1};Integrated Security=SSPI;Connection Timeout={2}' -f $SqlInstance, $Database, $ConnectionTimeout
-        $SqlConnection = New-Object -TypeName System.Data.SqlClient.SqlConnection -ArgumentList $SqlConnectionString
-        $SqlConnection.Open()
-
-        Write-Message -Level Verbose -Message "Started at $(Get-Date)"
     }
     process {
-        if ($Query) {
-            $SqlQuery = $Query
-        } else {
-            foreach ($tbl in $Table) {
-                #$Database = $tbl.Database
-                #$Schema = $tbl.Schema
-                #$Name = $tbl.Name
-                $SqlQuery = "SELECT $(
-                if($Top){"TOP $Top "}; ObtenirCols -columns $tbl.Columns
-                )`nFROM {0}.{1}.{2};" -f $tbl.Database, $tbl.Schema, $tbl.Name
-            }
-        }
-        # Running query...
-        $SqlCommand = $SqlConnection.CreateCommand()
-        $SqlCommand.CommandText = $SqlQuery
-        $SqlCommand.CommandTimeout = 0
-        $SqlDataReader = $SqlCommand.ExecuteReader()
+        foreach ($instance in $SqlInstance) {
+            try {
+                $server = Connect-DbaInstance -SqlInstance $instance -SqlCredential $SqlCredential -Database $Database -MinimumVersion 9
+                $sqlConn = $server.ConnectionContext.SqlConnectionObject
+                #if ($sqlConn.State -ne 'Open') { $sqlConn.Open() } # This is an abondance of precaution. Connect-DbaInstance opens the connection
 
-        if ($SqlDataReader.HasRows) {
+                if ($PSCmdlet.ParameterSetName -eq 'TableOrView') {
 
-            # Get the table schema from the data reader
-            $schema = $SqlDataReader.GetSchemaTable()
+                    # $tbl can be a table or a view. They all gets transformed to queries and sent to ExportQuery
+                    foreach ($tbl in $Table) {
+                        if ($obj = Get-DbaDbTable -SqlInstance $SqlInstance -Database $Database -Schema $Schema -Table $tbl -Verbose:$false) {
+                            $commandText = ("SELECT $(if($Top){"TOP $Top "}; ConvertToTsqlColumnList -Columns $obj.Columns)
+                            FROM [{0}].[{1}].[{2}];" -f $obj.Database, $obj.Schema, $obj.Name) -replace ' {2,}', ' '
+                            $tableRowCount = [math]::Min($tbl.RowCount, $Top)
+                        } elseif ($obj = Get-DbaDbView -SqlInstance $SqlInstance -Database $tbl.Database -Schema $tbl.Schema -View $tbl.Name -Verbose:$false) {
+                            $commandText = "SELECT $(if($Top){"TOP $Top "})`nFROM [{0}].[{1}].[{2}];" -f $obj.Database, $obj.Schema, $obj.Name
+                        } else {
+                            Write-Message -Level Warning -Message "$tbl was not found in $SqlInstance $Database $Schema" -Continue
+                        }
 
-            # Define the data table that will contain the batch rows
-            $data = New-Object System.Data.DataTable
+                        # $obj was found
+                        # $fullname = '[{0}].[{1}].[{2}]' -f $obj.Database, $obj.Schema, $obj.Name
 
-            # Define columns in the data buffer
-            foreach ($colDef in $schema.Rows) {
-                $colName = $colDef.ColumnName
-                switch ($colDef.DataType) {
-                    # Binary needs to be transformed in hexadecimal
-                    ([System.Byte[]]) { $colType = [System.String]; break }
-                    default { $colType = $colDef.DataType }
+                        # Running query...
+                        $splatExportQuery = @{
+                            sqlConn = $sqlConn
+                            Query   = $commandText
+                        }
+                        if ($tableRowCount) { $splatExportQuery.Add('TableRowCount', $tableRowCount) }
+
+                        $PSBoundParameters.GetEnumerator() | Where-Object Key -in ('Delimiter,BatchSize,Encoding,IncludeTypeInformation,NoHeader,
+                        UseQuote,QuoteFields,CommandTimeout,MaxFileSize' -replace '\s+' -split ',') | ForEach-Object {
+                            $splatExportQuery.Add($_.Key, $_.Value)
+                        }
+
+                        ExportQuery @splatExportQuery
+
+                    }
+                } elseif ($PSCmdlet.ParameterSetName -eq 'OneQuery') {
+                    # Running query...
+                    $splatExportQuery = @{
+                        sqlConn  = $sqlConn
+                        Query    = $commandText
+                        FilePath = $FilePath
+                    }
+                    $PSBoundParameters.GetEnumerator() | Where-Object Key -in ('Delimiter,BatchSize,Encoding,IncludeTypeInformation,NoHeader,
+                    UseQuote,QuoteFields,CommandTimeout,MaxFileSize,NoHeader' -replace '\s+' -split ',') | ForEach-Object {
+                        $splatExportQuery.Add($_.Key, $_.Value)
+                    }
+
+                    ExportQuery @splatExportQuery
+
+                    [PSCustomObject]@{
+                        FullName    = '{0}.{1}.{2}' -f $obj.Database, $obj.Schema, $obj.Name
+                        CommandText = "SELECT $(if($Top){"TOP $Top "})`nFROM [{0}].[{1}].[{2}];" -f $obj.Database, $obj.Schema, $obj.Name
+                        Object      = $obj
+                    }
                 }
-                [void]$data.Columns.Add($colName, $colType)
+            } catch {
+                throw $_
+                #Stop-Function -Message "Failure" -Category ConnectionError -ErrorRecord $_ -Target $instance -Continue
             }
-            [int64]$rows = 0
-            [int]$batches = 0
-            [int]$rid = 1
-            [int]$fid = 1
-
-            $filePath = New-CsvFile -FileId $fid -tblObj $tbl
-
         }
-
-
-
-
-
-
-
-
-
-
-
     }
     end {
         # Close everything just in case & ignore errors
-
-        $null = $SqlConnection.Close()
-        $null = $SqlConnection.Dispose()
+        $ErrorActionPreference = 'SilentlyContinue'
+        $null = $SqlDataReader.Close()
+        $null = $sqlDataReader.Dispose()
+        $null = $sqlConn.Close()
+        $null = $sqlConn.Dispose()
 
         # Script is finished. Show elapsed time.
-        $totaltime = [math]::Round($scriptelapsed.Elapsed.TotalSeconds, 2)
-        Write-Message -Level Verbose -Message "Total Elapsed Time for everything: $totaltime seconds"
+        $timer.Stop()
+        Write-Message -Level Verbose -Message "Total Elapsed Time $($timer.Elapsed.ToString())"
     }
 }
+<#
+        } else {
+        }
+        foreach ($qry in $queries) {
+            # $qry =@{Name, CommandText, Object}
+
+
+                # Prepare Export-Csv parameters (for all rows)
+                $splatExportCsv = @{
+                    Delimiter         = $Delimiter
+                    NoTypeInformation = -not $IncludeTypeInformation
+                    Encoding          = $Encoding
+                    Append            = $true
+                }
+                if ($PSVersionTable.PSVersion.Major -gt 5) {
+                    if ($UseQuotes) { $splatExportCsv.UseQuote = $UseQuotes }
+                    if ($QuoteFields) { $splatExportCsv.QuoteFields = $QuoteFields }
+                }
+
+                # RBAR Transfer process
+                while ($SqlDataReader.Read()) {
+                    $rowId++
+                    $newRow = $data.Rows.Add()
+
+                    # Copy row value in data buffer foreach column
+                    foreach ($col in $data.Columns) {
+                        # Copy value in the right column
+                        $value = $SqlDataReader[$col.ColumnName]
+                        if ($value -is [Byte[]]) {
+                            # Binary is transformed to hexadecimal
+                            $newRow[$col.ColumnName] = ConvertToHexadecimal $value
+                        } else {
+                            $newRow[$col.ColumnName] = $value
+                        }
+                    }
+
+                    # Start a new batch or a new csv file
+                    if (($rowId % $BatchSize -eq 0) -or $isNewFile) {
+                        $batch++
+
+                        # Flush data buffer to csv file
+                        Write-Verbose ($data.Columns -join ',')
+                        $data | Export-Csv -Path $csvPath @splatExportCsv
+
+                        # Stats about this batch
+                        Write-Message -Level Verbose -Message ('{0} rows in {1}' -f $rowId, $csvPath)
+
+                        # Cleanup
+                        $data.Clear()
+                        $isNewFile = $false
+                    }
+
+                    # Start a new file when file size reach MaxFileSize
+                    $csvSize = (Get-ChildItem $FilePath).Length
+                    if ($isNewFile = $csvSize -ge $MaxFileSize) {
+                        $csvPath = NewCsvFile -Path $Path -FileId (++$fid) -Obj $qry.Object
+                    }
+
+                    $data.Clear()
+                }
+                # Flush pending rows
+                if ($data.Rows.Count -gt 0) {
+                    Write-Message -Level Verbose -Message ('Flushing pending {0} rows' -f $data.Rows.Count)
+                }
+            }
+        }
+    }
+    end {
+        # Close everything just in case & ignore errors
+        $ErrorActionPreference = 'SilentlyContinue'
+        $null = $SqlDataReader.Close()
+        $null = $sqlDataReader.Dispose()
+        $null = $sqlConn.Close()
+        $null = $sqlConn.Dispose()
+
+        # Script is finished. Show elapsed time.
+        $timer.Stop()
+        Write-Message -Level Verbose -Message "Total Elapsed Time $($timer.Elapsed.ToString())"
+    }
+}
+#>
